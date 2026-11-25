@@ -1,0 +1,135 @@
+package com.carrymate.controller;
+
+import com.carrymate.dto.JwtResponse;
+import com.carrymate.dto.LoginRequest;
+import com.carrymate.dto.MessageResponse;
+import com.carrymate.dto.RegisterRequest;
+import com.carrymate.entity.User;
+import com.carrymate.repository.UserRepository;
+import com.carrymate.security.jwt.JwtUtils;
+import com.carrymate.security.services.UserDetailsImpl;
+import jakarta.validation.Valid;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+import java.util.stream.Collectors;
+
+@CrossOrigin(origins = "*", maxAge = 3600)
+@RestController
+@RequestMapping("/api/auth")
+public class AuthController {
+    @Autowired
+    AuthenticationManager authenticationManager;
+
+    @Autowired
+    UserRepository userRepository;
+
+    @Autowired
+    com.carrymate.repository.SenderProfileRepository senderProfileRepository;
+
+    @Autowired
+    com.carrymate.repository.TravelerProfileRepository travelerProfileRepository;
+
+    @Autowired
+    PasswordEncoder encoder;
+
+    @Autowired
+    JwtUtils jwtUtils;
+
+    @Autowired
+    com.carrymate.service.MailService mailService;
+
+    @PostMapping("/login")
+    public ResponseEntity<?> authenticateUser(@Valid @RequestBody LoginRequest loginRequest) {
+
+        Authentication authentication = authenticationManager.authenticate(
+                new UsernamePasswordAuthenticationToken(loginRequest.getUsername(), loginRequest.getPassword()));
+
+        SecurityContextHolder.getContext().setAuthentication(authentication);
+        String jwt = jwtUtils.generateJwtToken(authentication);
+
+        UserDetailsImpl userDetails = (UserDetailsImpl) authentication.getPrincipal();
+        List<String> roles = userDetails.getAuthorities().stream()
+                .map(item -> item.getAuthority())
+                .collect(Collectors.toList());
+
+        return ResponseEntity.ok(new JwtResponse(jwt,
+                userDetails.getId(),
+                userDetails.getUsername(),
+                userDetails.getEmail(),
+                roles,
+                userDetails.getKycVerified(),
+                userDetails.getUserType()));
+    }
+
+    @PostMapping("/register")
+    public ResponseEntity<?> registerUser(@Valid @RequestBody RegisterRequest signUpRequest) {
+        if (userRepository.existsByUsername(signUpRequest.getUsername())) {
+            return ResponseEntity
+                    .badRequest()
+                    .body(new MessageResponse("Error: Username is already taken!"));
+        }
+
+        if (userRepository.existsByEmail(signUpRequest.getEmail())) {
+            return ResponseEntity
+                    .badRequest()
+                    .body(new MessageResponse("Error: Email is already in use!"));
+        }
+
+        // Verify OTP
+        if (!mailService.verifyOtp(signUpRequest.getEmail(), signUpRequest.getOtp())) {
+            return ResponseEntity
+                    .status(401)
+                    .body(new MessageResponse("Error: Invalid or Expired OTP! Try again."));
+        }
+
+        // Create new user's account
+        User user = new User();
+        user.setUsername(signUpRequest.getUsername());
+        user.setEmail(signUpRequest.getEmail());
+        user.setPassword(encoder.encode(signUpRequest.getPassword()));
+        user.setFullName(signUpRequest.getFullName());
+        user.setPhoneNumber(signUpRequest.getPhoneNumber());
+        // Set basic role and type
+        try {
+            User.UserType selectedType = User.UserType.valueOf(signUpRequest.getUserType().toUpperCase());
+            user.setUserType(selectedType);
+            
+            // Assign ADMIN role if requested, otherwise USER
+            if (selectedType == User.UserType.ADMIN) {
+                user.setRole(User.Role.ADMIN);
+            } else {
+                user.setRole(User.Role.USER);
+            }
+        } catch (Exception e) {
+            user.setUserType(User.UserType.SENDER);
+            user.setRole(User.Role.USER);
+        }
+
+        userRepository.save(user);
+
+        // Save detailed profile separately
+        if (user.getUserType() == User.UserType.SENDER) {
+            com.carrymate.entity.SenderProfile senderProfile = new com.carrymate.entity.SenderProfile(user);
+            senderProfile.setCompanyName(signUpRequest.getCompanyName());
+            senderProfile.setDefaultPickupAddress(signUpRequest.getDefaultPickupAddress());
+            senderProfileRepository.save(senderProfile);
+        } else if (user.getUserType() == User.UserType.TRAVELER) {
+            com.carrymate.entity.TravelerProfile travelerProfile = new com.carrymate.entity.TravelerProfile(user);
+            travelerProfile.setFrequentRoute(signUpRequest.getFrequentRoute());
+            if (signUpRequest.getPreferredCurrency() != null && !signUpRequest.getPreferredCurrency().trim().isEmpty()) {
+                travelerProfile.setPreferredCurrency(signUpRequest.getPreferredCurrency());
+            }
+            travelerProfileRepository.save(travelerProfile);
+        }
+
+        return ResponseEntity.ok(new MessageResponse("User registered successfully!"));
+    }
+}
